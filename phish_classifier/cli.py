@@ -2,6 +2,8 @@
 
 Mirrors the classic `python email_scanner.py` flags, with type-checked
 options and `--help` generated automatically.
+
+Flow: mbox -> exact/subdomain whitelist -> strong model (single pass).
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ import typer
 
 from .scanner import (
     DEFAULT_OLLAMA_URL,
-    DEFAULT_SAFE_THRESHOLD,
     DEFAULT_STRONG_MODEL,
     EmailScanner,
     export_csv,
@@ -22,9 +23,9 @@ from .scanner import (
 )
 
 HELP = (
-    "Scan a Google Takeout .mbox archive for phishing with a two-stage "
-    "Ollama cascade (fast model -> strong model), a spoof-safe whitelist "
-    "and smart head-and-tail truncation. Everything runs locally/offline."
+    "Scan a Google Takeout .mbox archive for phishing with a local Ollama "
+    "model: an exact/subdomain whitelist skips trusted senders instantly, "
+    "everything else is decided by the strong model. Fully offline."
 )
 
 
@@ -42,17 +43,9 @@ def main(
     last: bool = typer.Option(
         False, "--last", help="Scan the LAST <limit> emails instead of the first."
     ),
-    big_only: bool = typer.Option(
-        False, "--big-only",
-        help="Skip the cascade: the strong model decides every email.",
-    ),
     strong: Optional[str] = typer.Option(
-        None, "--strong",
-        help=f"Override the strong model (default: {DEFAULT_STRONG_MODEL}).",
-    ),
-    fast: Optional[str] = typer.Option(
-        None, "--fast",
-        help="Override the fast (stage-1) model.",
+        None, "--strong", "-s",
+        help=f"Model that decides non-whitelisted emails (default: {DEFAULT_STRONG_MODEL}).",
     ),
     csv: Path = typer.Option(
         Path("scan_results.csv"), "--csv",
@@ -61,25 +54,18 @@ def main(
     url: str = typer.Option(
         DEFAULT_OLLAMA_URL, "--url", help="Ollama decision endpoint."
     ),
-    threshold: float = typer.Option(
-        DEFAULT_SAFE_THRESHOLD, "--threshold",
-        help="Stage-1 accept threshold for 'Safe' results.",
-    ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Print per-email decision details."
     ),
 ) -> None:
     """Scan MBOX emails and write the classified results to CSV."""
-    kwargs = {"ollama_url": url, "safe_threshold": threshold}
-    if fast:
-        kwargs["fast_model"] = fast
-    scanner = EmailScanner(**kwargs)
+    scanner = EmailScanner(ollama_url=url)
     if strong:
         scanner.strong_model = strong
 
     start = time.time()
     results = scanner.scan_mbox(
-        str(mbox), limit, from_end=last, verbose=verbose, big_only=big_only
+        str(mbox), limit, from_end=last, verbose=verbose
     )
     elapsed = time.time() - start
 

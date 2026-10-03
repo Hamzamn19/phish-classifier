@@ -1,13 +1,16 @@
-"""Ollama `/v1/systemone` client, two-stage cascade and scan orchestration.
+"""Ollama `/v1/systemone` client and scan orchestration.
 
-Cascade design (GPU-friendly: never two models resident at once):
-    Stage 1  fast model screens every non-whitelisted email on its own.
-             'Safe' >= threshold is final; everything else is queued.
-             The fast model is then UNLOADED -> its memory is freed.
-    Stage 2  strong model re-decides only the queued emails, then unloads.
+Single-pass design (simple and GPU-friendly - only ONE model ever loads):
 
-``big_only=True`` -> SINGLE pass: the strong model decides every email
-(no cascade, one model stays loaded for the whole run).
+    mbox -> exact/subdomain whitelist -> (trusted? Safe instantly)
+                                |
+                          (suspicious)
+                                v
+                     strong model decides: Safe / Spam / Phishing
+
+The whitelist answers in ~1ms with no GPU; the strong model (default
+``clef-flash-4k``) is loaded lazily on the first non-whitelisted email
+and unloaded when the scan finishes.
 """
 
 from __future__ import annotations
@@ -27,9 +30,7 @@ from . import extract
 from . import whitelist as wl
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/v1/systemone"
-DEFAULT_FAST_MODEL = "tev1-4k"
 DEFAULT_STRONG_MODEL = "clef-flash-4k"
-DEFAULT_SAFE_THRESHOLD = 0.58
 CLASSIFICATION_OPTIONS = ("Safe", "Spam", "Phishing")
 
 
@@ -37,17 +38,11 @@ class EmailScanner:
     def __init__(
         self,
         ollama_url: str = DEFAULT_OLLAMA_URL,
-        fast_model: str = DEFAULT_FAST_MODEL,
         strong_model: str = DEFAULT_STRONG_MODEL,
-        safe_threshold: float = DEFAULT_SAFE_THRESHOLD,
         whitelist_domains: Optional[List[str]] = None,
     ):
         self.ollama_url = ollama_url
-        self.fast_model = fast_model
         self.strong_model = strong_model
-        # Asymmetric threshold: only "Safe" results >= this value are
-        # accepted from the fast model.
-        self.safe_threshold = safe_threshold
         self.options = list(CLASSIFICATION_OPTIONS)
         self.max_text_length = extract.MAX_TEXT_LENGTH
 
@@ -168,40 +163,14 @@ class EmailScanner:
         except Exception:  # noqa: BLE001 - best effort only
             pass
 
-    # ---------------------------------------------------------------- cascade
+    # ---------------------------------------------------------------- decides
     def classify_email(self, email_text: str, verbose: bool = False) -> Optional[Dict]:
-        """Two-step model cascading with ASYMMETRIC threshold.
-
-        Stage 1 - fast model:
-          - If choice == "Safe" AND probability >= safe_threshold => accept.
-          - Otherwise (Spam/Phishing at any score, or Safe < threshold) => escalate.
-        Stage 2 - strong model: always the final decision.
-        """
-        # Stage 1: fast model
-        result = self._send_decision_with_retry(self.fast_model, email_text)
-
-        if result:
-            choice = result["classification"]
-            score = result["score"]
-            confidence = result.get("confidence", 0.0)
-            if choice == "Safe" and score >= self.safe_threshold:
-                if verbose:
-                    print(f"  [Stage 1 ACCEPTED] {self.fast_model}: {choice} "
-                          f"prob={score:.4f} conf={confidence:.4f} "
-                          f">= {self.safe_threshold}")
-                return result
-            if verbose:
-                print(f"  [Stage 1 ESCALATE] {self.fast_model}: {choice} "
-                      f"prob={score:.4f} conf={confidence:.4f} "
-                      f"(threshold={self.safe_threshold}) -> escalating "
-                      f"to {self.strong_model}")
-
-        # Stage 2: strong model (final decision regardless of score)
-        strong = self._send_decision_with_retry(self.strong_model, email_text)
-        if strong:
-            return strong
-
-        # Both stages failed; return stage-1 result (if any) as-is.
+        """Single decision from the strong model (whitelist is checked upstream)."""
+        result = self._send_decision_with_retry(self.strong_model, email_text)
+        if verbose and result:
+            print(f"[Model: {result['model']}] - Confidence: "
+                  f"{result.get('confidence', 0.0):.0%} - "
+                  f"Result: {result['classification']}")
         return result
 
     @staticmethod
@@ -236,61 +205,25 @@ class EmailScanner:
 
     def scan_mbox(self, mbox_path: str, limit: int = 5, from_end: bool = False,
                   verbose: bool = False, big_only: bool = False) -> List[Dict]:
-        """Scan in TWO SEQUENTIAL phases - never two models loaded together.
+        """Single-pass scan: exact/subdomain whitelist, then the strong model.
 
-        Phase 1  fast model screens EVERY email on its own.
-                 'Safe' >= threshold is final; everything else is queued.
-                 Fast model is then UNLOADED -> its leaked RAM is freed.
-        Phase 2  strong model re-decides only the queued emails.
-                 It is unloaded afterwards too.
-
-        big_only=True  -> SINGLE pass: the strong model decides EVERY email
-                          (no cascade, one model stays loaded all run).
+        big_only: deprecated, ignored. The single-model flow IS the default
+        now (kept so legacy ``--big-only`` commands keep working).
         """
+        del big_only  # deprecated no-op
         emails = self._load_emails(mbox_path, limit, from_end)
         if not emails:
             return []
 
         results: List[Optional[Dict]] = [None] * len(emails)
+        model_calls = 0
 
-        # ---------------- BIG MODEL ONLY: single pass ----------------
-        if big_only:
-            print(f"\n{'=' * 60}\nBIG MODEL ONLY - {self.strong_model} deciding "
-                  f"all {len(emails)} emails\n{'=' * 60}", file=sys.stderr)
-            for pos in tqdm(range(len(emails)),
-                            desc=f"Scanning ({self.strong_model})",
-                            unit="email", file=sys.stderr):
-                e = emails[pos]
-                if verbose:
-                    print(f"{'=' * 60}\nEmail #{e['index']}\n{'=' * 60}")
-                    print(f"From: {e['sender']}\nSubject: {e['subject']}")
-                    print(f"Body length: {len(e['text'])} characters")
+        print(f"\n{'=' * 60}\nSCAN - whitelist filter, then "
+              f"{self.strong_model} decides {len(emails)} emails\n"
+              f"{'=' * 60}", file=sys.stderr)
 
-                # Whitelist: trusted senders -> Safe immediately, no model call
-                trusted = self._whitelist_domain(e["sender"])
-                if trusted:
-                    if verbose:
-                        print(f"  [WHITELIST] {trusted} -> Safe (models skipped)")
-                    results[pos] = self._whitelist_row(e, trusted)
-                    continue
-
-                result = self._send_decision_with_retry(self.strong_model,
-                                                        e["text"])
-                if verbose and result:
-                    print(f"[Model: {result['model']}] - Confidence: "
-                          f"{result.get('confidence', 0.0):.0%} - "
-                          f"Result: {result['classification']}")
-                results[pos] = self._make_row(e, result)
-
-            return [r for r in results if r is not None]
-
-        escalate: List[int] = []
-
-        # ---------------- PHASE 1: fast model alone ----------------
-        print(f"\n{'=' * 60}\nPHASE 1 - {self.fast_model} screening all "
-              f"{len(emails)} emails\n{'=' * 60}", file=sys.stderr)
-
-        for pos in tqdm(range(len(emails)), desc=f"Phase 1 ({self.fast_model})",
+        for pos in tqdm(range(len(emails)),
+                        desc=f"Scanning ({self.strong_model})",
                         unit="email", file=sys.stderr):
             e = emails[pos]
             if verbose:
@@ -302,63 +235,24 @@ class EmailScanner:
             trusted = self._whitelist_domain(e["sender"])
             if trusted:
                 if verbose:
-                    print(f"  [WHITELIST] {trusted} -> Safe (models skipped)")
+                    print(f"  [WHITELIST] {trusted} -> Safe (model skipped)")
                 results[pos] = self._whitelist_row(e, trusted)
                 continue
 
-            result = self._send_decision_with_retry(self.fast_model, e["text"])
+            result = self._send_decision_with_retry(self.strong_model,
+                                                    e["text"])
+            model_calls += 1
+            if verbose and result:
+                print(f"[Model: {result['model']}] - Confidence: "
+                      f"{result.get('confidence', 0.0):.0%} - "
+                      f"Result: {result['classification']}")
+            elif verbose and not result:
+                print(f"  [ERROR] no decision for email #{e['index']}")
+            results[pos] = self._make_row(e, result)
 
-            if result:
-                choice = result["classification"]
-                score = result["score"]
-                conf = result.get("confidence", 0.0)
-                if verbose:
-                    print(f"[Model: {result['model']}] - Confidence: {conf:.0%} "
-                          f"- Result: {choice}")
-                    print(f"Probabilities (prob={score:.4f}, conf={conf:.4f}, "
-                          f"Safe threshold={self.safe_threshold}):")
-                    for label, prob in result["probabilities"].items():
-                        print(f"  {label}: {prob:.4f}")
-                    print()
-
-                if choice == "Safe" and score >= self.safe_threshold:
-                    results[pos] = self._make_row(e, result)          # FINAL
-                else:
-                    if verbose:
-                        print(f"  [ESCALATE] {choice} prob={score:.4f} "
-                              f"(threshold={self.safe_threshold}) -> queued "
-                              f"for {self.strong_model}")
-                    escalate.append(pos)                               # provisional
-                    results[pos] = self._make_row(e, result)
-            else:
-                escalate.append(pos)                                   # retry later
-                results[pos] = self._make_row(e, None)
-
-        # Free the fast model BEFORE loading the big one
-        self._stop_model(self.fast_model)
-
-        # ---------------- PHASE 2: strong model alone ----------------
-        if escalate:
-            print(f"\n{'=' * 60}\nPHASE 2 - {self.strong_model} re-deciding "
-                  f"{len(escalate)} escalated emails\n{'=' * 60}", file=sys.stderr)
-            for pos in tqdm(escalate, desc=f"Phase 2 ({self.strong_model})",
-                            unit="email", file=sys.stderr):
-                e = emails[pos]
-                strong = self._send_decision_with_retry(self.strong_model, e["text"])
-                if strong:
-                    if verbose:
-                        print(f"  [PHASE 2] #{e['index']} -> "
-                              f"{strong['classification']} "
-                              f"prob={strong['score']:.4f}")
-                    results[pos] = self._make_row(e, strong)           # FINAL
-                elif verbose:
-                    print(f"  [PHASE 2] #{e['index']} failed - keeping "
-                          f"phase-1 result")
-
+        # Free the GPU when the scan is over (only if we actually used it).
+        if model_calls:
             self._stop_model(self.strong_model)
-        else:
-            print(f"\nNo emails escalated - {self.strong_model} not needed.",
-                  file=sys.stderr)
 
         return [r for r in results if r is not None]
 
@@ -382,7 +276,7 @@ def export_csv(results: List[Dict], csv_path: str) -> None:
 
 def print_summary(scanner: EmailScanner, results: List[Dict],
                   elapsed: float) -> None:
-    """Final summary block (counts + cascade efficiency + flagged list)."""
+    """Final summary block (counts + decision sources + flagged list)."""
     cls_counts = Counter(r["classification"] for r in results)
     model_counts = Counter(r.get("model", "N/A") for r in results)
 
@@ -399,14 +293,16 @@ def print_summary(scanner: EmailScanner, results: List[Dict],
           f"({elapsed / max(len(results), 1):.2f}s/email)")
     print()
 
-    fast_count = model_counts.get(scanner.fast_model, 0)
-    strong_count = model_counts.get(scanner.strong_model, 0)
+    whitelist_count = sum(count for model, count in model_counts.items()
+                          if model.startswith("whitelist("))
+    model_count = sum(count for model, count in model_counts.items()
+                      if not model.startswith("whitelist("))
     total = len(results) or 1
-    print("Cascade efficiency:")
-    print(f"  {scanner.fast_model} only (fast path): "
-          f"{fast_count} ({fast_count / total:.0%})")
-    print(f"  {scanner.strong_model} (escalated):    "
-          f"{strong_count} ({strong_count / total:.0%})")
+    print("Decision source:")
+    print(f"  whitelist (instant, no GPU): "
+          f"{whitelist_count} ({whitelist_count / total:.0%})")
+    print(f"  {scanner.strong_model}:  "
+          f"{model_count} ({model_count / total:.0%})")
     print()
 
     flagged = [r for r in results if r["classification"] in ("Spam", "Phishing")]
@@ -418,14 +314,13 @@ def print_summary(scanner: EmailScanner, results: List[Dict],
 
 
 def main() -> None:
-    """CLI entry point (argparse-style parsing; typer planned for v0.1)."""
+    """Legacy CLI entry point (plain argv parsing; `phish-scan` is the Typer front-end)."""
     if len(sys.argv) < 2:
         print("Usage: python -m phish_classifier.scanner <mbox> [limit] "
-              "[--last] [--verbose] [--big-only] [--strong MODEL] [--csv PATH]")
+              "[--last] [--verbose] [--strong MODEL] [--csv PATH]")
         print("Examples:")
         print("  python email_scanner.py ~/Takeout/Mail/Inbox.mbox 5        # first 5")
         print("  python email_scanner.py ~/Takeout/Mail/Inbox.mbox 1000 --last  # last 1000")
-        print("  python email_scanner.py ~/Takeout/Mail/Inbox.mbox 19108 --big-only  # strong model only")
         print("  python email_scanner.py ~/Takeout/Mail/Inbox.mbox 3000 --last --strong nimble-4k --csv out.csv")
         sys.exit(1)
 
@@ -433,7 +328,6 @@ def main() -> None:
     limit = 5
     from_end = False
     verbose = False
-    big_only = False
     strong_override = None
     csv_override = None
 
@@ -445,7 +339,9 @@ def main() -> None:
         elif args[i] == "--verbose":
             verbose = True
         elif args[i] == "--big-only":
-            big_only = True
+            # Deprecated no-op: the single-model flow is now the default.
+            print("Note: --big-only is deprecated and ignored "
+                  "(single-model flow is the default).", file=sys.stderr)
         elif args[i] == "--strong" and i + 1 < len(args):
             strong_override = args[i + 1]
             i += 1
@@ -462,7 +358,7 @@ def main() -> None:
 
     start_time = time.time()
     results = scanner.scan_mbox(mbox_path, limit, from_end=from_end,
-                                verbose=verbose, big_only=big_only)
+                                verbose=verbose)
     elapsed = time.time() - start_time
 
     export_csv(results, csv_override or "scan_results_clef.csv")

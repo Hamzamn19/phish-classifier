@@ -1,9 +1,9 @@
 """phish_classifier - local phishing/ham classification for .mbox archives.
 
-Two-stage cascade on a local Ollama server:
-    fast model (screen) -> strong model (final decision),
-with a spoof-safe exact/subdomain whitelist in front and smart head-and-tail
-truncation of long bodies.  Everything runs offline on your own GPU.
+Single-pass pipeline on a local Ollama server:
+    spoof-safe exact/subdomain whitelist -> strong model (Safe/Spam/Phishing),
+with smart head-and-tail truncation of long bodies.  Everything runs
+offline on your own GPU.
 """
 
 from .extract import (

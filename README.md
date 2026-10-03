@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Hamzamn19/phish-classifier/actions/workflows/ci.yml/badge.svg)](https://github.com/Hamzamn19/phish-classifier/actions/workflows/ci.yml)
 
-**Local, offline phishing classification for `.mbox` archives using a two-stage Ollama cascade.**
+**Local, offline phishing classification for `.mbox` archives with a single strong Ollama model.**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-39%20passed-brightgreen)](#-testing)
@@ -17,7 +17,7 @@
 
 ## ✨ Highlights
 
-- **Two-stage cascade** — a fast ~0.8B model screens every email; only uncertain cases escalate to the strong model. Measured **0.38 s per decision** on an RTX 3060.
+- **Single strong model** — one model, one load, zero model-hopping: the whitelist answers instantly and only suspicious emails reach the GPU. Measured **0.38 s per decision** on an RTX 3060.
 - **Spoof-safe whitelist** — 859 trusted domains (curated + official [Rspamd DMARC list](https://github.com/rspamd/maps)) skipped instantly with **exact / subdomain matching** — not substring matching (see [Security](#-security-challenges--mitigations)).
 - **Smart head-and-tail truncation** — long emails keep their first *and* last 350 characters, so verdicts/subjects at the tail are never lost.
 - **Robust MIME parsing** — invalid charsets (e.g. `tr-ascii`) and one broken message never abort a run.
@@ -27,27 +27,11 @@
 ## 🏗 Architecture
 
 ```
-                ┌────────────────────────── .mbox (Google Takeout)
-                ▼
-        ┌───────────────┐   trusted?   ┌─────────────────────────┐
-        │   Extract     │─────────────▶│ Safe (score 1.0, no GPU)│
-        │ MIME + HTML   │              └─────────────────────────┘
-        │ head&tail cut │
-        └──────┬────────┘
-               │ not trusted
-               ▼
-        ┌───────────────┐  Safe ≥ 0.58 ┌─────────────────────────┐
-        │  Stage 1      │─────────────▶│ FINAL decision          │
-        │  fast model   │              └─────────────────────────┘
-        │  (tev1-4k)    │
-        └──────┬────────┘
-               │ Spam / Phishing / low-confidence Safe
-               ▼
-        ┌───────────────┐              ┌─────────────────────────┐
-        │  Stage 2      │─────────────▶│ FINAL decision          │
-        │  strong model │              └─────────────────────────┘
-        └───────────────┘
-   (models are loaded ONE AT A TIME to fit 12 GB VRAM)
+[ Email .mbox ] ──> [ Exact/Subdomain Whitelist ] ──(Safe)──> ✅ Skip (0.001s)
+                               │
+                          (Suspicious)
+                               ▼
+                    [ clef-flash-4k / nimble ] ──> 🎣 Phishing / ⚠️ Spam
 ```
 
 ## 🚀 Quick start
@@ -55,10 +39,9 @@
 ### 1. Prerequisites
 
 - Python **3.9+**
-- [Ollama](https://ollama.com) **≥ 0.35.1** with two models pulled:
+- [Ollama](https://ollama.com) **≥ 0.35.1** with the model pulled:
   ```bash
-  ollama pull tev1-4k        # fast stage-1 model
-  ollama pull clef-flash-4k  # strong stage-2 model
+  ollama pull clef-flash-4k   # the deciding model (or any model via --strong)
   ```
 - A GPU with ~11 GB free VRAM (tested on RTX 3060 12 GB).
 
@@ -82,8 +65,8 @@ phish-scan ~/Takeout/Mail/Inbox.mbox 1000 --last --csv results.csv
 # Classic entry point (unchanged, still supported)
 python email_scanner.py ~/Takeout/Mail/Inbox.mbox 1000 --last
 
-# Strong model only (no cascade)
-phish-scan inbox.mbox 500 --big-only --strong clef-flash-4k
+# Pick a different deciding model
+phish-scan inbox.mbox 500 --strong nimble-4k
 
 # Verbose per-email decisions
 phish-scan inbox.mbox 20 --last -v
@@ -92,11 +75,9 @@ phish-scan inbox.mbox 20 --last -v
 | Option | Meaning |
 |--------|---------|
 | `--last` | scan the newest N emails instead of the first N |
-| `--big-only` | skip stage 1; the strong model decides everything |
-| `--strong / --fast` | override the models |
-| `--threshold` | stage-1 accept threshold for `Safe` (default `0.58`) |
+| `--strong / -s` | override the deciding model (default `clef-flash-4k`) |
 | `--csv PATH` | output path (default `scan_results.csv`, `utf-8-sig`) |
-| `-v / --verbose` | print per-email probabilities and escalation decisions |
+| `-v / --verbose` | print per-email decisions and whitelist hits |
 
 ## 📊 Benchmarks (RTX 3060 12 GB, 19,108-email mailbox)
 
@@ -105,7 +86,11 @@ phish-scan inbox.mbox 20 --last -v
 | Whitelist coverage (exact/subdomain) | **62.0 %** of the mailbox skipped, **0.4 s total** |
 | Strong-model decision cost | **≈ 0.38 s / email** |
 | Full scan (direct strong model, 19,108 emails) | **57 min**, 0 errors, VRAM peak 10.9 GB |
-| 1,000-email cascade test | **50.2 s** — Safe 980 / Spam 14 / Phishing 6, 91 % whitelist skip |
+| 1,000-email single-pass test | **56.6 s** — Safe 917 / Spam 61 / Phishing 22, 91 % whitelist skip |
+
+> On the same 1,000-email sample the previous two-stage design flagged only 20
+> (the fast model wrongly accepted obvious spam as `Safe`). The single strong
+> model catches **83** — 4× more — for +6 s.
 
 > Timings depend on your GPU and how much of your mailbox the whitelist matches.
 
@@ -140,7 +125,7 @@ Two more hardening measures are built in:
 phish_classifier/
 ├── whitelist.py   # spoof-safe exact/subdomain whitelist + shipped Rspamd list
 ├── extract.py     # MIME/mbox extraction, HTML cleaning, smart head&tail cut
-├── scanner.py     # Ollama client, two-stage cascade, CSV export, summary
+├── scanner.py     # Ollama client, whitelist -> strong model, CSV export, summary
 ├── cli.py         # `phish-scan` Typer command
 └── whitelist_rspamd.txt   # official Rspamd DMARC whitelist (ships offline)
 email_scanner.py   # backward-compatible classic entry point
@@ -174,7 +159,7 @@ inference is intentionally not tested (non-deterministic).
 
 # 🛡️ phish-classifier (العربية)
 
-**تصنيف محلي وبدون إنترنت لرسائل التصيد في ملفات `.mbox` عبر تسلسل مرحلتين على خادم Ollama.**
+**تصنيف محلي وبدون إنترنت لرسائل التصيد في ملفات `.mbox` عبر نموذج Ollama قوي واحد.**
 
 > بريدك لا يغادر جهازك أبداً — لا سحابة، لا اتصال خارجي، كل شيء يعمل على كرتك الرسومي محلياً.
 
@@ -182,7 +167,7 @@ inference is intentionally not tested (non-deterministic).
 
 ## ✨ المميزات
 
-- **تسلسل مرحلتين (Cascade):** نموذج سريع (0.8B) يفحص كل رسالة، والمشبوه فقط يُحال للنموذج القوي — **0.38 ثانية لكل قرار** على RTX 3060.
+- **نموذج قوي واحد:** نموذج واحد يُحمَّل مرة واحدة فقط — القائمة البيضاء تجيب فوراً والمشبوه فقط يصل إلى كرت الرسوم — **0.38 ثانية لكل قرار** على RTX 3060.
 - **قائمة بيضاء آمنة ضد التزوير:** 859 نطاقاً موثوقاً (قائمة مُنسّقة + قائمة [Rspamd الرسمية](https://github.com/rspamd/maps)) تتخطّى فوراً بمطابقة **تامة أو فرعية** — وليست مطابقة جزئية (انظر قسم الأمان).
 - **قص ذكي (Head & Tail):** الرسائل الطويلة تحتفظ بأول 350 وآخر 350 حرفاً — الحُكم والموضوع في النهاية لا يضيعان.
 - **قراءة MIME متينة:** ترميزات معطوبة (`tr-ascii`) أو رسالة واحدة تالفة لا توقف المسح أبداً.
@@ -191,8 +176,7 @@ inference is intentionally not tested (non-deterministic).
 ## 🚀 البدء السريع
 
 ```bash
-# 1) المتطلبات: Python 3.9+ و Ollama >= 0.35.1 مع نموذجين
-ollama pull tev1-4k
+# 1) المتطلبات: Python 3.9+ و Ollama >= 0.35.1 مع النموذج
 ollama pull clef-flash-4k
 
 # 2) التثبيت
@@ -216,7 +200,11 @@ python email_scanner.py ~/Takeout/Mail/Inbox.mbox 1000 --last
 | تغطية القائمة البيضاء | **62%** تتخطّى في **0.4 ثانية** |
 | تكلفة قرار النموذج القوي | **≈ 0.38 ثانية/إيميل** |
 | مسح كامل (19,108) | **57 دقيقة** — صفر أخطاء — VRAM ذروته 10.9GB |
-| اختبار كاسكيد على 1000 | **50.2 ثانية** — Safe 980 / Spam 14 / Phishing 6 |
+| اختبار تمريرة واحدة على 1000 | **56.6 ثانية** — Safe 917 / Spam 61 / Phishing 22 |
+
+> على نفس العيّنة، تصميم التسلسل المرحلي القديم كان يرصد 20 فقط (النموذج
+> السريع كان يقبل إيميلات تصيد واضحة كـ`Safe`) — النموذج القوي الواحد يرصد
+> **83** (أي ~4× أكثر) بتكلفة +6 ثوانٍ فقط.
 
 ## 🔒 التحديات الأمنية والحلول
 
