@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phish-classifier"
+version = "0.1.0"
+description = "Local phishing/ham classifier for .mbox archives using a two-stage Ollama cascade (offline, privacy-first)."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "hamzah sheikh alashrah" }]
+requires-python = ">=3.9"
+keywords = [
+    "phishing",
+    "email",
+    "security",
+    "ollama",
+    "mbox",
+    "google-takeout",
+    "classification",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "requests>=2.28",
+    "beautifulsoup4>=4.11",
+    "tqdm>=4.64",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/Hamzamn19/phish-classifier"
+
+[project.scripts]
+phish-scan = "phish_classifier.cli:run"
+
+[tool.setuptools]
+packages = ["phish_classifier"]
+
+[tool.setuptools.package-data]
+phish_classifier = ["whitelist_rspamd.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

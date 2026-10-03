@@ -1,0 +1,21 @@
+# Personal Data & Results
+*.csv
+*.mbox
+*.eml
+*.zip
+Takeout/
+scan_*.log
+*.vram
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
