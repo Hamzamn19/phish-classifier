@@ -1,5 +1,7 @@
 # 🛡️ phish-classifier
 
+[![CI](https://github.com/Hamzamn19/phish-classifier/actions/workflows/ci.yml/badge.svg)](https://github.com/Hamzamn19/phish-classifier/actions/workflows/ci.yml)
+
 **Local, offline phishing classification for `.mbox` archives using a two-stage Ollama cascade.**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)

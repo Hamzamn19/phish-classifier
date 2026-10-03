@@ -37,7 +37,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = [
+    "pytest>=7.0",
+    "pandas>=2.0",   # analysis notebooks/scripts only, not the runtime
+]
 
 [project.urls]
 Homepage = "https://github.com/Hamzamn19/phish-classifier"
